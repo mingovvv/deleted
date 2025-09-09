@@ -4,11 +4,10 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.poi.openxml4j.opc.PackagePart;
 import org.apache.poi.openxml4j.opc.PackageRelationship;
-import org.apache.poi.ss.usermodel.Cell;
-import org.apache.poi.ss.usermodel.DateUtil;
-import org.apache.poi.ss.usermodel.Row;
-import org.apache.poi.ss.usermodel.Workbook;
+import org.apache.poi.ss.usermodel.*;
 import org.apache.poi.ss.util.WorkbookUtil;
+import org.apache.poi.xssf.streaming.SXSSFSheet;
+import org.apache.poi.xssf.streaming.SXSSFWorkbook;
 import org.apache.poi.xssf.usermodel.*;
 import org.jxls.common.Context;
 import org.jxls.util.JxlsHelper;
@@ -49,8 +48,7 @@ public class ExcelService {
                 jxlsHelper.processTemplate(is, baos, new Context());
                 log.info("jxlsHelper processTemplate");
 
-                return insertAllSheetsOfBIntoMiddleOfA(baos.toByteArray(), attachedExcelFile);
-
+                return insertAllSheetsOfBIntoMiddleOfA2(baos.toByteArray(), attachedExcelFile);
             }
 
         } catch (Exception e) {
@@ -102,6 +100,44 @@ public class ExcelService {
         }
     }
 
+    private static byte[] insertAllSheetsOfBIntoMiddleOfA2(byte[] aBytes, Resource bExcel) throws IOException {
+        try (XSSFWorkbook aWb = new XSSFWorkbook(new ByteArrayInputStream(aBytes));
+             InputStream bIs = bExcel.getInputStream();
+             XSSFWorkbook bWb = new XSSFWorkbook(bIs);
+             ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+
+            int aCount = aWb.getNumberOfSheets();
+            if (aCount >= 3) {
+                for (int i = aCount - 2; i >= 1; i--) {
+                    aWb.removeSheetAt(i);
+                }
+            }
+
+            try (SXSSFWorkbook sxssf = new SXSSFWorkbook(aWb, 100, true, true)) {
+                for (int j = 0; j < bWb.getNumberOfSheets(); j++) {
+                    XSSFSheet src = bWb.getSheetAt(j);
+                    String newName = uniqueSheetName(aWb, src.getSheetName());
+
+                    SXSSFSheet dest = sxssf.createSheet(newName);
+
+                    copyEntireSheet3(src, dest, 1000, 50);
+                    copyPicture(src, dest);
+
+                    sxssf.getXSSFWorkbook().setSheetOrder(newName, 1 + j);
+                }
+
+                sxssf.getXSSFWorkbook().setActiveSheet(0);
+                sxssf.getXSSFWorkbook().setFirstVisibleTab(0);
+                sxssf.getXSSFWorkbook().setForceFormulaRecalculation(true);
+
+                sxssf.write(out);
+                sxssf.dispose();
+            }
+
+            return out.toByteArray();
+        }
+    }
+
     private static String uniqueSheetName(XSSFWorkbook wb, String base) {
         String safe = WorkbookUtil.createSafeSheetName(base);
         if (wb.getSheet(safe) == null) return safe;
@@ -110,6 +146,84 @@ public class ExcelService {
             if (wb.getSheet(cand) == null) return cand;
         }
         return safe + " (" + System.currentTimeMillis() + ")";
+    }
+
+    private static void copyEntireSheet3(XSSFSheet src, SXSSFSheet dest, int flushEveryN, int keepRows) {
+        final XSSFWorkbook baseWb = dest.getWorkbook().getXSSFWorkbook();
+        final Map<Short, CellStyle> styleCache = new HashMap<>(256);
+
+        int rowsSinceFlush = 0;
+        int maxCol = -1;
+
+        final int firstRow = Math.max(0, src.getFirstRowNum());
+        final int lastRow  = src.getLastRowNum();
+
+        for (int r = firstRow; r <= lastRow; r++) {
+            XSSFRow sRow = src.getRow(r);
+            if (sRow == null) continue;
+
+            Row dRow = dest.createRow(r);
+
+            dRow.setHeight(sRow.getHeight());
+            try {
+                dRow.setZeroHeight(sRow.getZeroHeight());
+            } catch (Throwable ignore) { }
+
+            short firstCol = (sRow.getFirstCellNum() >= 0) ? sRow.getFirstCellNum() : 0;
+            short lastCol  = sRow.getLastCellNum();
+            if (lastCol < 0) continue;
+            if (lastCol - 1 > maxCol) maxCol = lastCol - 1;
+
+            for (int c = firstCol; c < lastCol; c++) {
+                XSSFCell sCell = sRow.getCell(c, Row.MissingCellPolicy.RETURN_NULL_AND_BLANK);
+                if (sCell == null) continue;
+
+                Cell dCell = dRow.createCell(c);
+
+                XSSFCellStyle sStyle = sCell.getCellStyle();
+                if (sStyle != null) {
+                    short idx = sStyle.getIndex();
+                    CellStyle cached = styleCache.get(idx);
+                    if (cached == null) {
+                        CellStyle cs = baseWb.createCellStyle();
+                        cs.cloneStyleFrom(sStyle);
+                        styleCache.put(idx, cs);
+                        cached = cs;
+                    }
+                    dCell.setCellStyle(cached);
+                }
+
+                switch (sCell.getCellType()) {
+                    case STRING -> dCell.setCellValue(sCell.getStringCellValue());
+                    case NUMERIC -> dCell.setCellValue(sCell.getNumericCellValue());
+                    case BOOLEAN -> dCell.setCellValue(sCell.getBooleanCellValue());
+                    case FORMULA -> dCell.setCellFormula(sCell.getCellFormula());
+                    case ERROR -> dCell.setCellErrorValue(sCell.getErrorCellValue());
+                    default -> {}
+                }
+            }
+
+            rowsSinceFlush++;
+            if (flushEveryN > 0 && rowsSinceFlush >= flushEveryN) {
+                try {
+                    dest.flushRows(Math.max(0, keepRows));
+                } catch (IOException e) {
+                    throw new RuntimeException("flushRows failed", e);
+                }
+                rowsSinceFlush = 0;
+            }
+        }
+
+        for (int i = 0; i < src.getNumMergedRegions(); i++) {
+            dest.addMergedRegion(src.getMergedRegion(i));
+        }
+
+        for (int c = 0; c <= maxCol; c++) {
+            dest.setColumnWidth(c, src.getColumnWidth(c));
+        }
+        dest.setDisplayGridlines(false);
+        dest.setPrintGridlines(src.isPrintGridlines());
+        dest.getPrintSetup().setLandscape(src.getPrintSetup().getLandscape());
     }
 
     private static void copyEntireSheet2(XSSFSheet src, XSSFSheet dest) {
@@ -204,7 +318,6 @@ public class ExcelService {
                         srcDrawing, dstDrawing, dst.getWorkbook(), pictureIndexCache);
                 continue;
             }
-            // 차트
             if (ctAnchor.isSetGraphicFrame()) {
                 CTGraphicalObjectData gd = ctAnchor.getGraphicFrame().getGraphic().getGraphicData();
                 if ("http://schemas.openxmlformats.org/drawingml/2006/chart".equals(gd.getUri())) {
@@ -216,9 +329,34 @@ public class ExcelService {
         }
     }
 
-    private static void copyPicture(CTMarker from, CTMarker to, CTPicture ctPic,
-                                    XSSFDrawing srcDrawing, XSSFDrawing dstDrawing, Workbook dstWb,
-                                    Map<String, Integer> pictureIndexCache) {
+    private static void copyPicture(XSSFSheet src, SXSSFSheet dst) {
+        XSSFDrawing srcDrawing = src.getDrawingPatriarch();
+        if (srcDrawing == null) return;
+
+        Drawing<?> dstDrawing = dst.createDrawingPatriarch();
+        Workbook wb = dst.getWorkbook();
+
+        for (CTTwoCellAnchor anchor : srcDrawing.getCTDrawing().getTwoCellAnchorList()) {
+            if (!anchor.isSetPic()) continue;
+
+            XSSFClientAnchor dstAnchor = new XSSFClientAnchor(
+                    (int)((long)anchor.getFrom().getColOff()),
+                    (int)((long)anchor.getFrom().getRowOff()),
+                    (int)((long)anchor.getTo().getColOff()),
+                    (int)((long)anchor.getTo().getRowOff()),
+                    anchor.getFrom().getCol(), anchor.getFrom().getRow(),
+                    anchor.getTo().getCol(),   anchor.getTo().getRow()
+            );
+
+            PictureData pd = extractPictureData(anchor.getPic(), srcDrawing);
+            if (pd == null || pd.bytes == null) continue;
+
+            int picIdx = wb.addPicture(pd.bytes, pd.poiType);
+            dstDrawing.createPicture(dstAnchor, picIdx);
+        }
+    }
+
+    private static void copyPicture(CTMarker from, CTMarker to, CTPicture ctPic, XSSFDrawing srcDrawing, XSSFDrawing dstDrawing, Workbook dstWb, Map<String, Integer> pictureIndexCache) {
         XSSFClientAnchor anchor = new XSSFClientAnchor(
                 (int) ((long) from.getColOff()), (int) ((long) from.getRowOff()),
                 (int) ((long) to.getColOff()),   (int) ((long) to.getRowOff()),
@@ -234,8 +372,7 @@ public class ExcelService {
         dstDrawing.createPicture(anchor, idx);
     }
 
-    private static void copyChart(CTMarker from, CTMarker to, XSSFChart srcChart,
-                                  XSSFDrawing dstDrawing) {
+    private static void copyChart(CTMarker from, CTMarker to, XSSFChart srcChart, XSSFDrawing dstDrawing) {
         XSSFClientAnchor anchor = new XSSFClientAnchor(
                 (int) ((long) from.getColOff()), (int) ((long) from.getRowOff()),
                 (int) ((long) to.getColOff()),   (int) ((long) to.getRowOff()),
